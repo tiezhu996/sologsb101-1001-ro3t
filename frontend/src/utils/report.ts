@@ -2,6 +2,9 @@ import type { Blade } from '@/types/blade'
 import type { Segment } from '@/types/segment'
 import { DEFECT_STATES, DEFECT_TYPES, SEVERITIES, type Defect, type DefectState, type DefectType, type Severity } from '@/types/defect'
 import { WORK_ORDER_STATES, isOverdue, type WorkOrder, type WorkOrderState } from '@/types/workOrder'
+import type { Table } from 'dexie'
+import type { Turbine } from '@/types/turbine'
+import type { ReportSnapshot, ReportVersion } from '@/types/reportVersion'
 import { defectAreaCm2, percentOf, SEVERITY_WEIGHT } from '@/utils/severity'
 
 /** 报告页 / 导出文件里的一行分布统计 */
@@ -41,12 +44,27 @@ export interface ReportWorkOrderLine {
   overdue: boolean
 }
 
+/** 已冻结版本的版本信息（仅已出具的报告携带；实时台账草稿不带） */
+export interface ReportVersionInfo {
+  reportSeriesId: string
+  versionId: string
+  versionNo: number
+  status: ReportVersion['status']
+  frozenAt: string
+  issuedBy: string
+  revisionNote: string
+  baseVersionId: string | null
+  supersededById: string | null
+}
+
 /** 按机组生成的巡检报告数据结构（同时作为导出 JSON 的结构） */
 export interface TurbineReport {
   app: 'gbwindblade'
   kind: 'turbine-inspection-report'
   dbVersion: number
   generatedAt: string
+  /** 已出具版本携带：报告始终按此版本的冻结快照读取，而非实时台账 */
+  versionInfo?: ReportVersionInfo
   turbine: {
     id: string
     code: string
@@ -97,7 +115,8 @@ export function buildTurbineReport(
   turbine: TurbineReport['turbine'],
   source: ReportSource,
   dbVersion: number,
-  generatedAt = new Date().toISOString()
+  generatedAt = new Date().toISOString(),
+  versionInfo?: ReportVersionInfo
 ): TurbineReport {
   const blades = source.blades
     .filter((blade) => blade.turbineId === turbine.id)
@@ -181,6 +200,7 @@ export function buildTurbineReport(
     kind: 'turbine-inspection-report',
     dbVersion,
     generatedAt,
+    ...(versionInfo ? { versionInfo } : {}),
     turbine,
     summary: {
       bladeCount: blades.length,
@@ -224,7 +244,16 @@ export const DISTRIBUTION_LABELS: {
 export function reportToText(report: TurbineReport): string {
   const lines: string[] = []
   lines.push(`风电叶片巡检报告 · ${report.turbine.code}（${report.turbine.model}）`)
-  lines.push(`生成时间：${report.generatedAt}`)
+  if (report.versionInfo) {
+    const statusText = report.versionInfo.status === 'current' ? '当前版本' : '已被替代'
+    lines.push(
+      `报告版本：V${report.versionInfo.versionNo}（${statusText}）｜出具时间：${report.versionInfo.frozenAt}｜出具人：${report.versionInfo.issuedBy || '—'}`
+    )
+    if (report.versionInfo.baseVersionId) lines.push(`本版修订自上一版；说明：${report.versionInfo.revisionNote || '—'}`)
+    if (report.versionInfo.supersededById) lines.push('本版已被新版本替代，仅供历史对账查阅')
+  } else {
+    lines.push(`（实时台账草稿，尚未出具）生成时间：${report.generatedAt}`)
+  }
   lines.push(`数据结构版本：v${report.dbVersion}（IndexedDB 库 gbwindblade）`)
   lines.push('')
   lines.push('一、总体统计')
@@ -278,8 +307,92 @@ export function reportToText(report: TurbineReport): string {
   return lines.join('\n')
 }
 
-/** 导出文件名 */
+/** 导出文件名：已出具版本带 Vn 版本号，草稿带 draft 标记 */
 export function reportFileName(report: TurbineReport): string {
-  const stamp = report.generatedAt.slice(0, 19).replace(/[:T]/g, '')
-  return `gbwindblade-${report.turbine.code}-report-v${report.dbVersion}-${stamp}.json`
+  const stamp = (report.versionInfo?.frozenAt ?? report.generatedAt).slice(0, 19).replace(/[:T]/g, '')
+  const version = report.versionInfo ? `V${report.versionInfo.versionNo}` : 'draft'
+  return `gbwindblade-${report.turbine.code}-report-${version}-${stamp}.json`
+}
+
+/* ---------------- 冻结快照 ---------------- */
+
+/** 剥离仅用于页面预览的剖面图 DataURL，快照只保留可导出的台账字段 */
+function stripSegmentPreview(segment: Segment): Segment {
+  if (!('sectionPreview' in segment)) return segment
+  const { sectionPreview: _sectionPreview, ...rest } = segment as Segment & {
+    sectionPreview?: string
+  }
+  return rest as Segment
+}
+
+/**
+ * 出具时点冻结：按机组把叶片 → 分段 → 缺陷 → 工单整条链复制成快照。
+ * 必须在 Dexie 事务内调用，保证五类表读到的是同一时点，
+ * 避免出具过程中缺陷 / 工单被改动而冻结出半新半旧的数据。
+ */
+export async function captureTurbineSnapshot(
+  turbineId: string,
+  tx: {
+    turbines: Table<Turbine, string>
+    blades: Table<Blade, string>
+    segments: Table<Segment, string>
+    defects: Table<Defect, string>
+    workOrders: Table<WorkOrder, string>
+  }
+): Promise<ReportSnapshot> {
+  const turbineRow = await tx.turbines.get(turbineId)
+  if (!turbineRow) throw new Error('机组已不在台账中，无法按当前台账冻结；旧报告版本仍可从版本台账打开')
+
+  const turbine: ReportSnapshot['turbine'] = {
+    id: turbineRow.id,
+    code: turbineRow.code,
+    model: turbineRow.model,
+    hubHeightM: turbineRow.hubHeightM,
+    commissionDate: turbineRow.commissionDate,
+    bladeCount: turbineRow.bladeCount
+  }
+  const blades = (await tx.blades.where('turbineId').equals(turbineId).toArray()).map((blade) => ({ ...blade }))
+  const bladeIds = blades.map((blade) => blade.id)
+  const segments = (await tx.segments.where('bladeId').anyOf(bladeIds).toArray()).map(stripSegmentPreview)
+  const segmentIds = segments.map((segment) => segment.id)
+  const defects = (await tx.defects.where('segmentId').anyOf(segmentIds).toArray()).map((defect) => ({ ...defect }))
+  const defectIds = defects.map((defect) => defect.id)
+  const workOrders = (await tx.workOrders.where('defectId').anyOf(defectIds).toArray()).map((order) => ({ ...order }))
+
+  return { turbine, blades, segments, defects, workOrders }
+}
+
+/** 用冻结快照重建报告（旧版本打开 / 导出的唯一入口，绝不回链实时台账） */
+export function reportFromSnapshot(
+  snapshot: ReportSnapshot,
+  dbVersion: number,
+  versionInfo: ReportVersionInfo
+): TurbineReport {
+  return buildTurbineReport(
+    { ...snapshot.turbine },
+    {
+      blades: snapshot.blades,
+      segments: snapshot.segments,
+      defects: snapshot.defects,
+      workOrders: snapshot.workOrders
+    },
+    dbVersion,
+    versionInfo.frozenAt,
+    versionInfo
+  )
+}
+
+/** 从版本记录提取报告版本信息 */
+export function versionInfoOf(version: ReportVersion): ReportVersionInfo {
+  return {
+    reportSeriesId: version.reportSeriesId,
+    versionId: version.id,
+    versionNo: version.versionNo,
+    status: version.status,
+    frozenAt: version.frozenAt,
+    issuedBy: version.issuedBy,
+    revisionNote: version.revisionNote,
+    baseVersionId: version.baseVersionId,
+    supersededById: version.supersededById
+  }
 }

@@ -4,12 +4,13 @@ import type { Blade, BladeMaterial, BladeSerial } from '@/types/blade'
 import type { Segment, SegmentFace } from '@/types/segment'
 import type { Defect, DefectState, DefectType, Severity } from '@/types/defect'
 import type { WorkOrder, WorkOrderState } from '@/types/workOrder'
+import type { ReportSnapshot, ReportVersion } from '@/types/reportVersion'
 
 /** 本地 IndexedDB 库名 */
 export const DB_NAME = 'gbwindblade'
 
 /** 本地结构版本号：新增 / 修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧的少量元数据键 */
 export const LS_KEYS = {
@@ -38,6 +39,8 @@ export interface BackupPayload {
   segments: Segment[]
   defects: Defect[]
   workOrders: WorkOrder[]
+  /** 已出具的报告版本（冻结快照），随备份迁移；旧版备份文件中可能缺失，按空数组处理 */
+  reportVersions?: ReportVersion[]
 }
 
 /** 全部业务表集合，清空与导入共用 */
@@ -46,7 +49,8 @@ export const ALL_TABLES = [
   'blades',
   'segments',
   'defects',
-  'workOrders'
+  'workOrders',
+  'reportVersions'
 ] as const
 
 export class WindBladeDatabase extends Dexie {
@@ -55,6 +59,8 @@ export class WindBladeDatabase extends Dexie {
   segments!: Table<Segment, string>
   defects!: Table<Defect, string>
   workOrders!: Table<WorkOrder, string>
+  /** 已出具 / 修订的巡检报告版本，正文为冻结快照，不随台账事后变动 */
+  reportVersions!: Table<ReportVersion, string>
 
   constructor() {
     super(DB_NAME)
@@ -66,7 +72,7 @@ export class WindBladeDatabase extends Dexie {
       workOrders: 'id, defectId, team, state, updatedAt'
     })
     // v2：分段补充检修面索引，缺陷补充面位 / 状态 / 发现日期索引，工单补充限期索引
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         turbines: 'id, code, model, commissionDate, updatedAt',
         blades: 'id, turbineId, serial, material, updatedAt',
@@ -101,6 +107,17 @@ export class WindBladeDatabase extends Dexie {
             if (!segment.face) segment.face = 'PS'
           })
       })
+    // v3：新增报告版本表（出具冻结 + 修订链）。纯新增表，历史数据无需迁移
+    this.version(3)
+      .stores({
+        turbines: 'id, code, model, commissionDate, updatedAt',
+        blades: 'id, turbineId, serial, material, updatedAt',
+        segments: 'id, bladeId, index, face, updatedAt',
+        defects: 'id, segmentId, type, severity, face, state, foundAt, updatedAt',
+        workOrders: 'id, defectId, team, state, dueDate, updatedAt',
+        reportVersions:
+          'id, reportSeriesId, turbineId, versionNo, status, frozenAt, supersededById, updatedAt'
+      })
   }
 }
 
@@ -114,15 +131,20 @@ export function createId(prefix: string): string {
 
 /** 清空全部业务表，供「清空本地数据」与导入前覆盖使用 */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.turbines, db.blades, db.segments, db.defects, db.workOrders], async () => {
-    await Promise.all([
-      db.turbines.clear(),
-      db.blades.clear(),
-      db.segments.clear(),
-      db.defects.clear(),
-      db.workOrders.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.reportVersions],
+    async () => {
+      await Promise.all([
+        db.turbines.clear(),
+        db.blades.clear(),
+        db.segments.clear(),
+        db.defects.clear(),
+        db.workOrders.clear(),
+        db.reportVersions.clear()
+      ])
+    }
+  )
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -394,15 +416,96 @@ export async function seedDemoData(): Promise<boolean> {
     })
   })
 
+  // 报告版本演示链：机组一 WT-A01 已出过两版——V1 已被 V2 替代（V1 时一条裂纹误判为轻度），
+  // V2 为当前版本。两版均持有各自的冻结快照，可分别打开 / 导出核对
+  const reportVersions: ReportVersion[] = []
+  const seedTurbine = turbines[0]
+  if (seedTurbine) {
+    const buildSeedSnapshot = (): ReportSnapshot => {
+      const seedBlades = blades.filter((blade) => blade.turbineId === seedTurbine.id).map((blade) => ({ ...blade }))
+      const seedBladeIds = new Set(seedBlades.map((blade) => blade.id))
+      const seedSegments = segments
+        .filter((segment) => seedBladeIds.has(segment.bladeId))
+        .map((segment) => ({ ...segment }))
+      const seedSegmentIds = new Set(seedSegments.map((segment) => segment.id))
+      const seedDefects = defects
+        .filter((defect) => seedSegmentIds.has(defect.segmentId))
+        .map((defect) => ({ ...defect }))
+      const seedDefectIds = new Set(seedDefects.map((defect) => defect.id))
+      const seedOrders = workOrders
+        .filter((order) => seedDefectIds.has(order.defectId))
+        .map((order) => ({ ...order }))
+      return {
+        turbine: {
+          id: seedTurbine.id,
+          code: seedTurbine.code,
+          model: seedTurbine.model,
+          hubHeightM: seedTurbine.hubHeightM,
+          commissionDate: seedTurbine.commissionDate,
+          bladeCount: seedTurbine.bladeCount
+        },
+        blades: seedBlades,
+        segments: seedSegments,
+        defects: seedDefects,
+        workOrders: seedOrders
+      }
+    }
+
+    const snapshotV1 = buildSeedSnapshot()
+    // 还原 V1 的历史误判：A 叶第 2 段 1450 mm 裂纹在首版被标为轻度
+    const misjudged = snapshotV1.defects.find((defect) => defect.type === '裂纹' && defect.lengthMm === 1450)
+    if (misjudged) misjudged.severity = '轻度'
+
+    const seriesId = createId('rsr')
+    const v1Id = createId('rpt')
+    const v2Id = createId('rpt')
+    const v1FrozenAt = new Date(now - 9 * 24 * 60 * 60 * 1000).toISOString()
+    const v2FrozenAt = new Date(now - 2 * 24 * 60 * 60 * 1000).toISOString()
+
+    reportVersions.push({
+      id: v1Id,
+      reportSeriesId: seriesId,
+      turbineId: seedTurbine.id,
+      turbineCode: seedTurbine.code,
+      versionNo: 1,
+      status: 'superseded',
+      frozenAt: v1FrozenAt,
+      issuedBy: '巡检班·周一组',
+      revisionNote: '首次出具月度巡检报告。',
+      baseVersionId: null,
+      supersededById: v2Id,
+      snapshot: snapshotV1,
+      createdAt: now - 9 * 24 * 60 * 60 * 1000,
+      updatedAt: now - 2 * 24 * 60 * 60 * 1000
+    })
+    reportVersions.push({
+      id: v2Id,
+      reportSeriesId: seriesId,
+      turbineId: seedTurbine.id,
+      turbineCode: seedTurbine.code,
+      versionNo: 2,
+      status: 'current',
+      frozenAt: v2FrozenAt,
+      issuedBy: '复检·吴琳',
+      revisionNote: '现场复检复核：A 叶第 2 段 1450 mm 裂纹程度由轻度更正为重度，重新出具。',
+      baseVersionId: v1Id,
+      supersededById: null,
+      snapshot: buildSeedSnapshot(),
+      createdAt: now - 2 * 24 * 60 * 60 * 1000,
+      updatedAt: now - 2 * 24 * 60 * 60 * 1000
+    })
+  }
+
   await db.transaction(
     'rw',
-    [db.turbines, db.blades, db.segments, db.defects, db.workOrders],
+    [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.reportVersions],
     async () => {
       await db.turbines.bulkPut(turbines)
       await db.blades.bulkPut(blades)
       await db.segments.bulkPut(segments)
       await db.defects.bulkPut(defects)
       await db.workOrders.bulkPut(workOrders)
+      await db.reportVersions.bulkPut(reportVersions)
     }
   )
 

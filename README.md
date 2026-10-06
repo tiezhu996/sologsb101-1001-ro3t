@@ -42,9 +42,9 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`） | `npm run build` 内含 `vue-tsc --noEmit` 类型检查，零错误 |
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、对话框、步骤流转、上传、折叠面板等交互 |
 | 构建工具 | Vite 6 | 开发服务器端口 22801 |
-| 状态管理 | Pinia（setup store） | `turbineStore` / `bladeStore` / `defectStore` / `workOrderStore` |
+| 状态管理 | Pinia（setup store） | `turbineStore` / `bladeStore` / `defectStore` / `workOrderStore` / `reportStore`（报告出具冻结与修订链） |
 | 路由 | Vue Router 4（history 模式） | nginx 侧用 `try_files $uri $uri/ /index.html` 做 SPA fallback |
-| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号与 `upgrade` 升级迁移逻辑 |
+| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号（v3）与 `upgrade` 升级迁移逻辑 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
 
 ---
@@ -57,7 +57,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | `/blades/:id/segments` | 叶片分段与剖面 | Blade、Segment、Defect | 叶片切换、**按段数批量生成展向分段**、单段新增 / 编辑 / 删除、上传剖面图（本地预览）、按检修面查看段内缺陷、行内改状态 |
 | `/defects` | 缺陷标注台 | Defect、Segment | 按机组 / 类型 / 程度 / 面位 / 状态组合筛选（同步 URL query）、单条标注、勾选后批量改等级 / 改类型 / 改状态、批量派工、批量删除 |
 | `/workorders` | 维修工单 | WorkOrder、Defect | 按班组与状态筛选、派工建单、限期跟催（超期高亮）、状态流转 `待派 → 处理中 → 待验收 → 已闭环`、验收回写缺陷为已修复、撤回验收、删除后同步缺陷状态 |
-| `/report` | 报告与导出 | 全部模型 | 按机组生成巡检报告预览（分级分布、分段明细、工单跟踪）、查看数据结构版本、导出报告 / 全量备份 JSON、导入 JSON（覆盖 / 合并 / 追加）、清空与重新播种 |
+| `/report` | 报告与导出 | 全部模型 + ReportVersion | **出具即冻结**：出具时把机组「叶片 → 分段 → 缺陷 → 工单」全链复制成快照并生成版本号；查看 / 导出已出具版本一律读快照，事后改台账旧报告不变。更正只能从最新版本**发起修订**：按当前台账冻结生成下一版，原版保留并标记替代关系（前链 baseVersionId / 后链 supersededById）；机组、叶片或工单被移走后旧报告仍可凭快照打开导出。另支持结构版本查看、导出报告 / 全量备份 JSON、导入 JSON（覆盖 / 合并 / 追加）、清空与重新播种 |
 
 ---
 
@@ -72,7 +72,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22801）
 ```
 
 > 首次打开页面会自动播种演示数据（幂等，只在机组表为空时执行）：
-> **2 台机组 × 各 2 片叶片 × 各 3 个展向分段 × 18 条缺陷 × 4 张工单**，5 个页面打开即有内容。
+> **2 台机组 × 各 2 片叶片 × 各 3 个展向分段 × 18 条缺陷 × 4 张工单**，并为 WT-A01 预置一条 **V1 → V2 报告修订链**（V1 中一条 1450 mm 裂纹误判为轻度、已被 V2 替代），5 个页面打开即有内容。
 
 ---
 
@@ -94,16 +94,24 @@ sologsb101-1001/
         ├── main.ts               # 挂载前先 ensureSeeded()，避免首屏空白
         ├── App.vue               # 顶部导航（5 个路由 + 数量徽标）、底部数据存储说明
         ├── styles/main.css
-        ├── types/                # turbine.ts blade.ts segment.ts defect.ts workOrder.ts
-        ├── stores/               # turbineStore.ts bladeStore.ts defectStore.ts workOrderStore.ts
+        ├── types/                # turbine.ts blade.ts segment.ts defect.ts workOrder.ts reportVersion.ts
+        ├── stores/               # turbineStore.ts bladeStore.ts defectStore.ts workOrderStore.ts reportStore.ts
         ├── hooks/                # useDefectFilter.ts useIdbTable.ts
-        ├── components/common/    # SeverityTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
+        ├── components/common/    # SeverityTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue ReportDetail.vue
         ├── utils/                # db.ts severity.ts report.ts export.ts
         ├── pages/                # TurbineList.vue BladeSegment.vue DefectBoard.vue WorkOrderList.vue ReportView.vue
         └── router/index.ts       # /turbines、/blades/:id/segments、/defects、/workorders、/report
 ```
 
 分层约定：**页面只读 store，跨页状态不放组件内部 state**；`types/` 定义实体与筛选条件，`stores/` 维护列表与派生统计，`hooks/` 封装 Dexie 订阅与缺陷筛选派生值，`utils/` 提供持久化、单位换算与报告导出。
+
+### 报告出具与修订（冻结快照，月底可对账）
+
+- **出具冻结**：在「报告与导出」页对机组点击「出具冻结（V1）」，系统在单个 Dexie 事务内把当时的机组头、叶片、分段、缺陷、工单整链复制为快照存入 `reportVersions`，并生成系列 id 与版本号 V1；同事务复查「是否已出具」，双击 / 多标签页并发也只会落一条 V1。
+- **同一版永远按快照**：已出具版本的查看与导出只走该版快照（`reportFromSnapshot`），**不回链当前台账**——事后改缺陷、改工单、移叶片都不会让已发出的报告悄悄变数字。
+- **更正走修订**：只能从最新版本（`current`）发起；修订按**当前台账**重新冻结生成 V(n+1)，原版本一字不改地保留、状态落为 `superseded`，前后版本通过 `baseVersionId` / `supersededById` 互相标注替代关系，修订必须填写更正说明。
+- **台账移走不影响旧报告**：机组 / 叶片 / 工单被删除不级联报告版本；版本台账里标记「机组已移走」，旧报告仍可打开、导出；机组不在当前台账时修订按钮禁用（新报告无当前台账可依据）。
+- 实时台账仍可在「当前台账草稿」页签预览，草稿导出文件名带 `draft`，与已出具版本明确区分。
 
 ---
 
@@ -112,11 +120,12 @@ sologsb101-1001/
 | 项目 | 说明 |
 | --- | --- |
 | 库名 | IndexedDB `gbwindblade`（Dexie 封装） |
-| 结构版本 | `DB_VERSION = 2`，`utils/db.ts` 内含版本号与 `upgrade` 迁移（补全缺陷状态、工单验收字段、分段剖面图字段） |
-| 对象表 | `turbines`、`blades`、`segments`、`defects`、`workOrders`，均按 `id` 主键 + 外键索引 |
-| 级联关系 | 机组 → 叶片 → 展向分段 → 缺陷 → 维修工单；删除上级会级联清理下级记录 |
+| 结构版本 | `DB_VERSION = 3`，`utils/db.ts` 内含版本号与 `upgrade` 迁移（v3 新增 `reportVersions` 报告版本表） |
+| 对象表 | `turbines`、`blades`、`segments`、`defects`、`workOrders`、`reportVersions`，均按 `id` 主键 + 外键索引 |
+| 级联关系 | 机组 → 叶片 → 展向分段 → 缺陷 → 维修工单；删除上级会级联清理下级记录（**报告版本不参与级联**，见下） |
+| 报告出具与修订 | 出具时在同一事务内冻结机组全链快照存入 `reportVersions`（系列 id + `versionNo`，首版 V1）；已出具版本只读快照、不回链实时台账；修订仅允许从 `status=current` 的最新版发起，原版落为 `superseded` 并记录 `supersededById`，新版本 `baseVersionId` 回指原版；机组 / 叶片 / 工单被删除不影响历史版本，旧报告仍能打开、导出 |
 | localStorage | `gbwindblade:ui-prefs`（上次查看的机组 / 叶片）、`gbwindblade:db-version`、`gbwindblade:last-backup-at` |
-| 备份 | 「报告与导出」页可导出 / 导入 JSON，导入支持覆盖、按 id 合并、追加（重新分配 id）三种方式 |
-| 演示数据 | 首次进入自动播种，幂等；也可在页面空状态点击「生成演示数据」或报告页「重新播种演示数据」 |
+| 备份 | 「报告与导出」页可导出 / 导入 JSON，导入支持覆盖、按 id 合并、追加（重新分配 id，并重建版本系列与快照内外键）三种方式 |
+| 演示数据 | 首次进入自动播种，幂等；报告样例：WT-A01 预置 V1（一条 1450 mm 裂纹误判为轻度）→ V2（复检更正为重度）的已替代链；也可在页面空状态点击「生成演示数据」或报告页「重新播种演示数据」 |
 
 > 数据不会上传到任何服务器；换浏览器或清理浏览器数据会导致本地记录丢失，请及时导出 JSON 备份。
