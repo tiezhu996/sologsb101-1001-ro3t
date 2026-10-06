@@ -6,9 +6,14 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import type { ReportVersion } from '@/types/reportVersion'
 import { reportFileName, type TurbineReport } from '@/utils/report'
 
-const COLLECTIONS = ['turbines', 'blades', 'segments', 'defects', 'workOrders'] as const
+/** 备份中参与计数 / 导入的集合（含报告版本） */
+const COLLECTIONS = ['turbines', 'blades', 'segments', 'defects', 'workOrders', 'reportVersions'] as const
+
+/** 旧版备份文件没有 reportVersions，校验时只强制五大台账数组 */
+const REQUIRED_COLLECTIONS = ['turbines', 'blades', 'segments', 'defects', 'workOrders'] as const
 
 type CollectionKey = (typeof COLLECTIONS)[number]
 
@@ -24,7 +29,7 @@ export function validateBackup(input: unknown): {
   }
   const obj = input as Partial<BackupPayload>
   if (obj.app !== 'gbwindblade') errors.push('app 字段应为 gbwindblade，文件来源不明')
-  for (const key of COLLECTIONS) {
+  for (const key of REQUIRED_COLLECTIONS) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -37,19 +42,21 @@ export function validateBackup(input: unknown): {
     blades: obj.blades ?? [],
     segments: obj.segments ?? [],
     defects: obj.defects ?? [],
-    workOrders: obj.workOrders ?? []
+    workOrders: obj.workOrders ?? [],
+    reportVersions: Array.isArray(obj.reportVersions) ? obj.reportVersions : []
   }
   return { ok: true, errors, payload }
 }
 
 /** 组装当前本地数据的全量备份对象 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [turbines, blades, segments, defects, workOrders] = await Promise.all([
+  const [turbines, blades, segments, defects, workOrders, reportVersions] = await Promise.all([
     db.turbines.toArray(),
     db.blades.toArray(),
     db.segments.toArray(),
     db.defects.toArray(),
-    db.workOrders.toArray()
+    db.workOrders.toArray(),
+    db.reportVersions.toArray()
   ])
   return {
     app: 'gbwindblade',
@@ -59,7 +66,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     blades,
     segments,
     defects,
-    workOrders
+    workOrders,
+    reportVersions
   }
 }
 
@@ -82,7 +90,8 @@ export function countPayload(payload: BackupPayload): Record<CollectionKey, numb
     blades: payload.blades.length,
     segments: payload.segments.length,
     defects: payload.defects.length,
-    workOrders: payload.workOrders.length
+    workOrders: payload.workOrders.length,
+    reportVersions: payload.reportVersions?.length ?? 0
   }
 }
 
@@ -123,13 +132,18 @@ export async function importBackup(
   overwrite: boolean
 ): Promise<Record<CollectionKey, number>> {
   if (overwrite) await clearAllTables()
-  await db.transaction('rw', [db.turbines, db.blades, db.segments, db.defects, db.workOrders], async () => {
-    await db.turbines.bulkPut(payload.turbines)
-    await db.blades.bulkPut(payload.blades)
-    await db.segments.bulkPut(payload.segments)
-    await db.defects.bulkPut(payload.defects)
-    await db.workOrders.bulkPut(payload.workOrders)
-  })
+  await db.transaction(
+    'rw',
+    [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.reportVersions],
+    async () => {
+      await db.turbines.bulkPut(payload.turbines)
+      await db.blades.bulkPut(payload.blades)
+      await db.segments.bulkPut(payload.segments)
+      await db.defects.bulkPut(payload.defects)
+      await db.workOrders.bulkPut(payload.workOrders)
+      if (payload.reportVersions) await db.reportVersions.bulkPut(payload.reportVersions)
+    }
+  )
   return countPayload(payload)
 }
 
@@ -166,5 +180,36 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     defectId: defectIdMap.get(order.defectId) ?? order.defectId
   }))
 
-  return { ...payload, turbines, blades, segments, defects, workOrders }
+  // 报告版本另起一条链：顶层引用（机组 / 上一版 / 新版）全部重映射；
+  // snapshot 内部保持原样作为冻结档案，不与新台账的 id 发生关联
+  const missingTurbineIdMap = new Map<string, string>()
+  const oldVersionIdToNew = new Map<string, string>()
+  const reportVersions: ReportVersion[] = (payload.reportVersions ?? [])
+    .map((version) => {
+      const newId = createId('rpv')
+      oldVersionIdToNew.set(version.id, newId)
+      let newTurbineId = turbineIdMap.get(version.turbineId)
+      if (!newTurbineId) {
+        // 备份机组表已没有该机组（历史遗留报告）：给同一条链的各版一个稳定的空挂机组 id
+        newTurbineId = missingTurbineIdMap.get(version.turbineId)
+        if (!newTurbineId) {
+          newTurbineId = createId('tbn')
+          missingTurbineIdMap.set(version.turbineId, newTurbineId)
+        }
+      }
+      return { ...version, id: newId, turbineId: newTurbineId }
+    })
+    .map((version) => ({
+      ...version,
+      supersedesVersionId:
+        version.supersedesVersionId !== null
+          ? (oldVersionIdToNew.get(version.supersedesVersionId) ?? null)
+          : null,
+      supersededByVersionId:
+        version.supersededByVersionId !== null
+          ? (oldVersionIdToNew.get(version.supersededByVersionId) ?? null)
+          : null
+    }))
+
+  return { ...payload, turbines, blades, segments, defects, workOrders, reportVersions }
 }

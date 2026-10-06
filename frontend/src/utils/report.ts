@@ -41,12 +41,34 @@ export interface ReportWorkOrderLine {
   overdue: boolean
 }
 
+/** 报告版本元信息：挂在出具 / 修订冻结下来的快照上 */
+export interface TurbineReportVersionMeta {
+  /** 版本记录 id（reportVersions 表主键） */
+  versionId: string
+  reportNo: string
+  /** 版本号，从 1 开始 */
+  versionNo: number
+  /** 出具时间 ISO 字符串（等同快照生成时间） */
+  issuedAt: string
+  issuedBy: string
+  /** 修订说明，首版为空字符串 */
+  revisionReason: string
+  /** 上一版 id，首版为 null */
+  supersedesVersionId: string | null
+}
+
 /** 按机组生成的巡检报告数据结构（同时作为导出 JSON 的结构） */
 export interface TurbineReport {
   app: 'gbwindblade'
   kind: 'turbine-inspection-report'
   dbVersion: number
   generatedAt: string
+  /**
+   * 版本元信息：仅「已出具 / 已修订」的冻结快照携带；
+   * 台账实时预览（未出具）没有该字段。
+   * 存在即代表这份报告必须按快照口径展示，不得用当前台账重算。
+   */
+  version?: TurbineReportVersionMeta
   turbine: {
     id: string
     code: string
@@ -220,11 +242,44 @@ export const DISTRIBUTION_LABELS: {
   order: WORK_ORDER_STATES
 }
 
+/**
+ * 递归冻结报告快照。
+ * 已出具的报告按快照口径展示，冻结后任何误写（把快照当台账直接改字段）
+ * 都会立即抛错，避免「已发出的报告在库里悄悄改数」。
+ */
+export function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== 'object') return value
+  Object.values(value as Record<string, unknown>).forEach((child) => {
+    if (child !== null && (typeof child === 'object' || typeof child === 'function')) {
+      deepFreeze(child)
+    }
+  })
+  return Object.freeze(value)
+}
+
+/** 给出具 / 修订冻结下来的报告快照盖上版本信息 */
+export function attachVersionMeta(
+  report: TurbineReport,
+  meta: TurbineReportVersionMeta
+): TurbineReport {
+  return { ...report, generatedAt: meta.issuedAt, version: meta }
+}
+
 /** 报告纯文本预览（用于「查看导出结构」） */
 export function reportToText(report: TurbineReport): string {
   const lines: string[] = []
   lines.push(`风电叶片巡检报告 · ${report.turbine.code}（${report.turbine.model}）`)
   lines.push(`生成时间：${report.generatedAt}`)
+  if (report.version) {
+    lines.push(
+      `报告编号：${report.version.reportNo}｜版本：V${report.version.versionNo}（冻结快照口径，不再随台账变化）｜出具人：${report.version.issuedBy}`
+    )
+    if (report.version.revisionReason) {
+      lines.push(`修订说明：${report.version.revisionReason}`)
+    }
+  } else {
+    lines.push('（台账实时预览，尚未出具；点「出具」后冻结为正式版本）')
+  }
   lines.push(`数据结构版本：v${report.dbVersion}（IndexedDB 库 gbwindblade）`)
   lines.push('')
   lines.push('一、总体统计')
@@ -278,8 +333,12 @@ export function reportToText(report: TurbineReport): string {
   return lines.join('\n')
 }
 
-/** 导出文件名 */
+/** 导出文件名：正式版本带报告编号与版本号，实时预览退化为旧规则 */
 export function reportFileName(report: TurbineReport): string {
+  if (report.version) {
+    const stamp = report.version.issuedAt.slice(0, 19).replace(/[:T]/g, '')
+    return `gbwindblade-${report.version.reportNo}-v${report.version.versionNo}-${stamp}.json`
+  }
   const stamp = report.generatedAt.slice(0, 19).replace(/[:T]/g, '')
   return `gbwindblade-${report.turbine.code}-report-v${report.dbVersion}-${stamp}.json`
 }

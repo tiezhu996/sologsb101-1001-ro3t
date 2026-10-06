@@ -2,7 +2,7 @@
 
 面向风电场运维班组的叶片巡检与检修人员：把无人机 / 望远镜巡检发现的叶片缺陷按**展向分段**逐条落档，并派发维修工单直到闭环验收。
 
-核心动作：**建立机组与叶片台账 → 划分展向分段并挂接剖面图 → 标注缺陷类型与尺寸面位 → 派发维修工单 → 导出巡检报告**。
+核心动作：**建立机组与叶片台账 → 划分展向分段并挂接剖面图 → 标注缺陷类型与尺寸面位 → 派发维修工单 → 出具巡检报告（冻结快照、版本化，更正走修订）**。
 
 纯前端单页应用（Vue 3 + TypeScript + Element Plus + Vite + Pinia + Vue Router + Dexie），**无后端、无数据库服务、无 API 服务**，全部数据保存在浏览器本地（IndexedDB 库名 `gbwindblade`，另有少量 localStorage 元数据），刷新或重启浏览器后依然存在。
 
@@ -42,7 +42,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`） | `npm run build` 内含 `vue-tsc --noEmit` 类型检查，零错误 |
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、对话框、步骤流转、上传、折叠面板等交互 |
 | 构建工具 | Vite 6 | 开发服务器端口 22801 |
-| 状态管理 | Pinia（setup store） | `turbineStore` / `bladeStore` / `defectStore` / `workOrderStore` |
+| 状态管理 | Pinia（setup store） | `turbineStore` / `bladeStore` / `defectStore` / `workOrderStore` / `reportVersionStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧用 `try_files $uri $uri/ /index.html` 做 SPA fallback |
 | 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号与 `upgrade` 升级迁移逻辑 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
@@ -57,7 +57,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | `/blades/:id/segments` | 叶片分段与剖面 | Blade、Segment、Defect | 叶片切换、**按段数批量生成展向分段**、单段新增 / 编辑 / 删除、上传剖面图（本地预览）、按检修面查看段内缺陷、行内改状态 |
 | `/defects` | 缺陷标注台 | Defect、Segment | 按机组 / 类型 / 程度 / 面位 / 状态组合筛选（同步 URL query）、单条标注、勾选后批量改等级 / 改类型 / 改状态、批量派工、批量删除 |
 | `/workorders` | 维修工单 | WorkOrder、Defect | 按班组与状态筛选、派工建单、限期跟催（超期高亮）、状态流转 `待派 → 处理中 → 待验收 → 已闭环`、验收回写缺陷为已修复、撤回验收、删除后同步缺陷状态 |
-| `/report` | 报告与导出 | 全部模型 | 按机组生成巡检报告预览（分级分布、分段明细、工单跟踪）、查看数据结构版本、导出报告 / 全量备份 JSON、导入 JSON（覆盖 / 合并 / 追加）、清空与重新播种 |
+| `/report` | 报告与导出 | 全部模型 + ReportVersion | 按机组生成巡检报告预览（分级分布、分段明细、工单跟踪）；**点「出具」冻结当时台账生成 V1，更正只能从最新版发起修订（V2/V3……）并互标替代关系，旧版保留可对账**；版本查看 / 导出一律按冻结快照，台账实时预览与快照版本分口径提示；机组或工单被移走后旧报告仍可打开导出；查看数据结构版本、导出报告 / 全量备份 JSON、导入 JSON（覆盖 / 合并 / 追加）、清空与重新播种 |
 
 ---
 
@@ -94,8 +94,8 @@ sologsb101-1001/
         ├── main.ts               # 挂载前先 ensureSeeded()，避免首屏空白
         ├── App.vue               # 顶部导航（5 个路由 + 数量徽标）、底部数据存储说明
         ├── styles/main.css
-        ├── types/                # turbine.ts blade.ts segment.ts defect.ts workOrder.ts
-        ├── stores/               # turbineStore.ts bladeStore.ts defectStore.ts workOrderStore.ts
+        ├── types/                # turbine.ts blade.ts segment.ts defect.ts workOrder.ts reportVersion.ts
+        ├── stores/               # turbineStore.ts bladeStore.ts defectStore.ts workOrderStore.ts reportVersionStore.ts
         ├── hooks/                # useDefectFilter.ts useIdbTable.ts
         ├── components/common/    # SeverityTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── utils/                # db.ts severity.ts report.ts export.ts
@@ -112,11 +112,12 @@ sologsb101-1001/
 | 项目 | 说明 |
 | --- | --- |
 | 库名 | IndexedDB `gbwindblade`（Dexie 封装） |
-| 结构版本 | `DB_VERSION = 2`，`utils/db.ts` 内含版本号与 `upgrade` 迁移（补全缺陷状态、工单验收字段、分段剖面图字段） |
-| 对象表 | `turbines`、`blades`、`segments`、`defects`、`workOrders`，均按 `id` 主键 + 外键索引 |
-| 级联关系 | 机组 → 叶片 → 展向分段 → 缺陷 → 维修工单；删除上级会级联清理下级记录 |
+| 结构版本 | `DB_VERSION = 3`：v1 初版、v2 补全缺陷 / 工单 / 分段字段、v3 新增 `reportVersions` 报告版本表（历史数据无需迁移） |
+| 对象表 | `turbines`、`blades`、`segments`、`defects`、`workOrders`、`reportVersions`，均按 `id` 主键 + 外键索引 |
+| 级联关系 | 机组 → 叶片 → 展向分段 → 缺陷 → 维修工单；删除上级会级联清理下级记录。**`reportVersions` 不参与级联删除**：机组 / 叶片 / 工单被移走后，已出具报告仍保留，可在报告页「已移出台账机组的历史报告」中打开、导出 |
+| 报告版本 | 点「出具」冻结当时机组 → 叶片 → 分段 → 缺陷 → 工单整条链，生成报告编号 `RPT-<机组编号>-<年月>` 与 V1；查看 / 导出**只按冻结快照**（快照经深冻，误写会直接报错），台账实时预览仅用于未出具内容。更正只能从最新版「发起修订」，按当前台账生成 V(n+1)，原版置「已替代」并互标 `supersedes / supersededBy`，月底对账按版本号逐版核对 |
 | localStorage | `gbwindblade:ui-prefs`（上次查看的机组 / 叶片）、`gbwindblade:db-version`、`gbwindblade:last-backup-at` |
-| 备份 | 「报告与导出」页可导出 / 导入 JSON，导入支持覆盖、按 id 合并、追加（重新分配 id）三种方式 |
+| 备份 | 「报告与导出」页可导出 / 导入 JSON（含全部报告版本），导入支持覆盖、按 id 合并、追加（重新分配 id，并重建版本链 id 映射）三种方式 |
 | 演示数据 | 首次进入自动播种，幂等；也可在页面空状态点击「生成演示数据」或报告页「重新播种演示数据」 |
 
 > 数据不会上传到任何服务器；换浏览器或清理浏览器数据会导致本地记录丢失，请及时导出 JSON 备份。

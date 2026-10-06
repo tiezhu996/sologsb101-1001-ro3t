@@ -4,12 +4,13 @@ import type { Blade, BladeMaterial, BladeSerial } from '@/types/blade'
 import type { Segment, SegmentFace } from '@/types/segment'
 import type { Defect, DefectState, DefectType, Severity } from '@/types/defect'
 import type { WorkOrder, WorkOrderState } from '@/types/workOrder'
+import type { ReportVersion } from '@/types/reportVersion'
 
 /** 本地 IndexedDB 库名 */
 export const DB_NAME = 'gbwindblade'
 
 /** 本地结构版本号：新增 / 修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧的少量元数据键 */
 export const LS_KEYS = {
@@ -38,15 +39,18 @@ export interface BackupPayload {
   segments: Segment[]
   defects: Defect[]
   workOrders: WorkOrder[]
+  /** 已出具 / 已修订的报告版本（旧备份文件可能没有该字段，按空数组处理） */
+  reportVersions?: ReportVersion[]
 }
 
-/** 全部业务表集合，清空与导入共用 */
+/** 全部业务表集合，清空与导入共用（含报告版本表，保证备份完整） */
 export const ALL_TABLES = [
   'turbines',
   'blades',
   'segments',
   'defects',
-  'workOrders'
+  'workOrders',
+  'reportVersions'
 ] as const
 
 export class WindBladeDatabase extends Dexie {
@@ -55,6 +59,7 @@ export class WindBladeDatabase extends Dexie {
   segments!: Table<Segment, string>
   defects!: Table<Defect, string>
   workOrders!: Table<WorkOrder, string>
+  reportVersions!: Table<ReportVersion, string>
 
   constructor() {
     super(DB_NAME)
@@ -66,7 +71,7 @@ export class WindBladeDatabase extends Dexie {
       workOrders: 'id, defectId, team, state, updatedAt'
     })
     // v2：分段补充检修面索引，缺陷补充面位 / 状态 / 发现日期索引，工单补充限期索引
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         turbines: 'id, code, model, commissionDate, updatedAt',
         blades: 'id, turbineId, serial, material, updatedAt',
@@ -101,6 +106,15 @@ export class WindBladeDatabase extends Dexie {
             if (!segment.face) segment.face = 'PS'
           })
       })
+    // v3：新增报告版本表，出具即冻结快照 + 版本号 + 替代关系；历史数据无需迁移
+    this.version(DB_VERSION).stores({
+      turbines: 'id, code, model, commissionDate, updatedAt',
+      blades: 'id, turbineId, serial, material, updatedAt',
+      segments: 'id, bladeId, index, face, updatedAt',
+      defects: 'id, segmentId, type, severity, face, state, foundAt, updatedAt',
+      workOrders: 'id, defectId, team, state, dueDate, updatedAt',
+      reportVersions: 'id, turbineId, reportNo, versionNo, status, issuedAt, updatedAt'
+    })
   }
 }
 
@@ -114,15 +128,20 @@ export function createId(prefix: string): string {
 
 /** 清空全部业务表，供「清空本地数据」与导入前覆盖使用 */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.turbines, db.blades, db.segments, db.defects, db.workOrders], async () => {
-    await Promise.all([
-      db.turbines.clear(),
-      db.blades.clear(),
-      db.segments.clear(),
-      db.defects.clear(),
-      db.workOrders.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.turbines, db.blades, db.segments, db.defects, db.workOrders, db.reportVersions],
+    async () => {
+      await Promise.all([
+        db.turbines.clear(),
+        db.blades.clear(),
+        db.segments.clear(),
+        db.defects.clear(),
+        db.workOrders.clear(),
+        db.reportVersions.clear()
+      ])
+    }
+  )
 }
 
 /** 读取 localStorage 中的 UI 偏好 */

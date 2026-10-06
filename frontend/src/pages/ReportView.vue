@@ -1,11 +1,21 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox, type UploadFile } from 'element-plus'
-import { Delete, Document, Download, Refresh, Upload } from '@element-plus/icons-vue'
+import {
+  Delete,
+  Document,
+  Download,
+  EditPen,
+  Promotion,
+  Refresh,
+  Upload,
+  View
+} from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import SeverityTag from '@/components/common/SeverityTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useTurbineStore } from '@/stores/turbineStore'
+import { useReportVersionStore } from '@/stores/reportVersionStore'
 import {
   DB_NAME,
   DB_VERSION,
@@ -24,12 +34,14 @@ import {
   validateBackup
 } from '@/utils/export'
 import { buildTurbineReport, reportToText, type TurbineReport } from '@/utils/report'
+import { reportStatusTagType, type ReportVersion } from '@/types/reportVersion'
 import { formatArea, formatSize } from '@/utils/severity'
 import { FACE_LABEL, formatRange, type SegmentFace } from '@/types/segment'
 import { DEFECT_STATE_COLOR, type DefectState } from '@/types/defect'
 import type { BackupPayload } from '@/utils/db'
 
 const turbineStore = useTurbineStore()
+const reportVersionStore = useReportVersionStore()
 
 const selectedTurbineId = ref<string>(turbineStore.currentTurbineId ?? '')
 
@@ -50,10 +62,42 @@ watch(
 
 watch(selectedTurbineId, (value) => {
   if (value) turbineStore.setCurrentTurbine(value)
+  // 切换机组默认回到台账实时预览，避免把上一台的快照误当成本台数据
+  viewMode.value = 'current'
 })
 
-/** 按机组实时汇总缺陷统计并生成报告数据结构 */
-const report = computed<TurbineReport | null>(() => {
+/* ---------------- 报告版本 ---------------- */
+/** 预览口径：current=当前台账（未冻结）；snapshot=已出具版本的冻结快照 */
+const viewMode = ref<'current' | 'snapshot'>('current')
+const selectedVersionId = ref<string>('')
+
+const turbineVersions = computed<ReportVersion[]>(() =>
+  reportVersionStore.versionsOfTurbine(selectedTurbineId.value)
+)
+const latestVersion = computed<ReportVersion | null>(() =>
+  selectedTurbineId.value ? reportVersionStore.latestVersionOfTurbine(selectedTurbineId.value) : null
+)
+
+watch(
+  turbineVersions,
+  (list) => {
+    const stillBelongs = list.some((version) => version.id === selectedVersionId.value)
+    if (!stillBelongs) selectedVersionId.value = latestVersion.value?.id ?? ''
+  },
+  { immediate: true }
+)
+
+const selectedVersion = computed<ReportVersion | undefined>(() =>
+  selectedVersionId.value ? reportVersionStore.versionById(selectedVersionId.value) : undefined
+)
+
+/** 正在查看的版本：只有 snapshot 口径下存在；这是「同一版按快照」的唯一开关 */
+const activeVersion = computed<ReportVersion | null>(
+  () => (viewMode.value === 'snapshot' ? selectedVersion.value ?? null : null)
+)
+
+/** 按当前台账实时汇总（仅用于未冻结预览；出具 / 修订动作会在 store 里重新读库冻结） */
+const liveReport = computed<TurbineReport | null>(() => {
   const turbine = turbineStore.turbineById(selectedTurbineId.value)
   if (!turbine) return null
   return buildTurbineReport(
@@ -75,6 +119,125 @@ const report = computed<TurbineReport | null>(() => {
   )
 })
 
+/** 页面实际渲染的报告：查看版本时取冻结快照，否则取台账实时预览 */
+const report = computed<TurbineReport | null>(() => {
+  if (activeVersion.value) {
+    return reportVersionStore.snapshotOf(activeVersion.value.id)
+  }
+  return liveReport.value
+})
+
+/** 当前预览是否属于已移出台账的机组（旧报告仍可打开导出） */
+const activeVersionIsOrphan = computed<boolean>(
+  () => activeVersion.value !== null && !turbineStore.turbineById(activeVersion.value.turbineId)
+)
+
+function viewVersion(versionId: string): void {
+  selectedVersionId.value = versionId
+  viewMode.value = 'snapshot'
+}
+
+function backToLive(): void {
+  viewMode.value = 'current'
+}
+
+function formatTimestamp(value: number): string {
+  return new Date(value).toISOString().replace('T', ' ').slice(0, 19)
+}
+
+/* ---------------- 出具 ---------------- */
+const issueVisible = ref(false)
+const issueSubmitting = ref(false)
+const issueForm = ref({ issuedBy: '' })
+
+function openIssue(): void {
+  issueForm.value = { issuedBy: '' }
+  issueVisible.value = true
+}
+
+async function submitIssue(): Promise<void> {
+  if (!selectedTurbineId.value || !issueForm.value.issuedBy.trim()) {
+    ElMessage.warning('请填写出具人')
+    return
+  }
+  issueSubmitting.value = true
+  try {
+    const version = await reportVersionStore.issueReport({
+      turbineId: selectedTurbineId.value,
+      issuedBy: issueForm.value.issuedBy
+    })
+    issueVisible.value = false
+    ElMessage.success(`已出具 ${version.reportNo} V1：当前叶片、分段、缺陷、工单已冻结，之后改台账不影响本版`)
+    viewVersion(version.id)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '出具失败')
+  } finally {
+    issueSubmitting.value = false
+  }
+}
+
+/* ---------------- 修订 ---------------- */
+const reviseVisible = ref(false)
+const reviseSubmitting = ref(false)
+const reviseForm = ref({ issuedBy: '', revisionReason: '' })
+
+function openRevise(): void {
+  if (!latestVersion.value) {
+    ElMessage.warning('该机组还没有已出具版本，请先出具首版')
+    return
+  }
+  reviseForm.value = { issuedBy: '', revisionReason: '' }
+  reviseVisible.value = true
+}
+
+async function submitRevise(): Promise<void> {
+  if (!selectedTurbineId.value) return
+  if (!reviseForm.value.issuedBy.trim()) {
+    ElMessage.warning('请填写出具人')
+    return
+  }
+  if (!reviseForm.value.revisionReason.trim()) {
+    ElMessage.warning('请填写修订说明，便于月底对账时说明更正原因')
+    return
+  }
+  reviseSubmitting.value = true
+  try {
+    const version = await reportVersionStore.reviseReport({
+      turbineId: selectedTurbineId.value,
+      issuedBy: reviseForm.value.issuedBy,
+      revisionReason: reviseForm.value.revisionReason
+    })
+    reviseVisible.value = false
+    ElMessage.success(
+      `已按当前台账生成 ${version.reportNo} V${version.versionNo}，上一版保留并标记为「已替代」`
+    )
+    viewVersion(version.id)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '修订失败')
+  } finally {
+    reviseSubmitting.value = false
+  }
+}
+
+/* ---------------- 机组 / 叶片已移走的历史报告 ---------------- */
+const orphanGroups = computed(() => {
+  const groups = new Map<string, ReportVersion[]>()
+  reportVersionStore.orphanVersions.forEach((version) => {
+    const list = groups.get(version.turbineId) ?? []
+    list.push(version)
+    groups.set(version.turbineId, list)
+  })
+  return [...groups.entries()].map(([turbineId, list]) => {
+    const sorted = [...list].sort((a, b) => b.versionNo - a.versionNo)
+    return {
+      turbineId,
+      turbineCode: list[0]?.turbineCode ?? '—',
+      count: list.length,
+      latest: sorted[0] as ReportVersion
+    }
+  })
+})
+
 const dbMeta = computed(() => ({
   name: DB_NAME,
   version: DB_VERSION,
@@ -84,7 +247,8 @@ const dbMeta = computed(() => ({
   blades: turbineStore.blades.length,
   segments: turbineStore.segments.length,
   defects: turbineStore.defects.length,
-  workOrders: turbineStore.workOrders.length
+  workOrders: turbineStore.workOrders.length,
+  reportVersions: reportVersionStore.versions.length
 }))
 
 /** 面位中文标签（模板内免去类型断言） */
@@ -108,18 +272,22 @@ function openStructure(): void {
 async function handleExportBackup(): Promise<void> {
   const result = await exportBackupJson()
   ElMessage.success(
-    `已导出备份 ${result.fileName}（机组 ${result.counts.turbines} · 叶片 ${result.counts.blades} · 分段 ${result.counts.segments} · 缺陷 ${result.counts.defects} · 工单 ${result.counts.workOrders}）`
+    `已导出备份 ${result.fileName}（机组 ${result.counts.turbines} · 叶片 ${result.counts.blades} · 分段 ${result.counts.segments} · 缺陷 ${result.counts.defects} · 工单 ${result.counts.workOrders} · 报告版本 ${result.counts.reportVersions}）`
   )
 }
 
 function handleExportReport(): void {
   const current = report.value
   if (!current) {
-    ElMessage.warning('请先选择机组')
+    ElMessage.warning('请先选择机组或历史版本')
     return
   }
   const fileName = exportReportJson(current)
-  ElMessage.success(`已导出巡检报告 ${fileName}`)
+  ElMessage.success(
+    current.version
+      ? `已导出冻结快照 ${fileName}（${current.version.reportNo} V${current.version.versionNo}）`
+      : `已导出当前台账预览 ${fileName}（未出具，非正式版本）`
+  )
 }
 
 /* ---------------- 导入 ---------------- */
@@ -173,7 +341,7 @@ async function submitImport(): Promise<void> {
     importVisible.value = false
     const modeText =
       importMode.value === 'overwrite' ? '覆盖导入' : importMode.value === 'append' ? '追加导入（已重新分配 id）' : '按 id 合并导入'
-    ElMessage.success(`${modeText}完成：机组 ${payload.turbines.length} · 叶片 ${payload.blades.length} · 分段 ${payload.segments.length} · 缺陷 ${payload.defects.length} · 工单 ${payload.workOrders.length}`)
+    ElMessage.success(`${modeText}完成：机组 ${payload.turbines.length} · 叶片 ${payload.blades.length} · 分段 ${payload.segments.length} · 缺陷 ${payload.defects.length} · 工单 ${payload.workOrders.length} · 报告版本 ${payload.reportVersions?.length ?? 0}`)
   } finally {
     importSubmitting.value = false
   }
@@ -185,7 +353,7 @@ const maintenanceWorking = ref(false)
 async function handleClear(): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      '清空会删除本浏览器 IndexedDB 中的全部机组、叶片、分段、缺陷与工单记录，且不可恢复。确认清空？',
+      '清空会删除本浏览器 IndexedDB 中的全部机组、叶片、分段、缺陷、工单与已出具报告版本，且不可恢复。确认清空？',
       '清空本地数据确认',
       { type: 'warning', confirmButtonText: '确认清空', cancelButtonText: '取消' }
     )
@@ -228,7 +396,7 @@ watch(bladePanels, (panels) => {
     <div class="page-title">
       <div>
         <h2>报告与导出</h2>
-        <p>按机组汇总巡检结果生成报告预览，查看本地数据结构版本，并导出 / 导入 JSON 数据。</p>
+        <p>出具即冻结当时机组、叶片、分段、缺陷与工单并生成版本号；更正只能从最新版发起修订，旧版保留可对账。</p>
       </div>
       <div class="toolbar">
         <el-select v-model="selectedTurbineId" placeholder="选择机组" class="turbine-select">
@@ -240,7 +408,9 @@ watch(bladePanels, (panels) => {
           />
         </el-select>
         <el-button :icon="Document" @click="openStructure">查看导出结构</el-button>
-        <el-button :icon="Download" @click="handleExportReport" :disabled="!report">导出本机组报告</el-button>
+        <el-button :icon="Download" @click="handleExportReport" :disabled="!report">
+          {{ activeVersion ? '导出当前版本快照' : '导出本机组报告' }}
+        </el-button>
         <el-button type="primary" :icon="Download" @click="handleExportBackup">导出全量备份</el-button>
         <el-upload
           :auto-upload="false"
@@ -254,9 +424,9 @@ watch(bladePanels, (panels) => {
     </div>
 
     <EmptyPanel
-      v-if="turbineStore.turbines.length === 0"
+      v-if="turbineStore.turbines.length === 0 && orphanGroups.length === 0"
       title="暂无可生成报告的机组"
-      description="先建立机组台账，或直接播种演示数据后再生成巡检报告。"
+      description="先建立机组台账，或直接播种演示数据后再出具巡检报告。"
       :show-seed="true"
       @seed="handleReseed"
     />
@@ -287,10 +457,188 @@ watch(bladePanels, (panels) => {
           <el-descriptions-item label="缺陷 / 工单">
             {{ dbMeta.defects }} 条 / {{ dbMeta.workOrders }} 张
           </el-descriptions-item>
+          <el-descriptions-item label="已出具报告版本">{{ dbMeta.reportVersions }} 个</el-descriptions-item>
         </el-descriptions>
       </div>
 
+      <!-- 机组 / 叶片 / 工单已移走，但历史报告仍需可打开导出 -->
+      <div v-if="orphanGroups.length > 0" class="section-card">
+        <div class="section-card__head">
+          <h3>已移出台账机组的历史报告</h3>
+          <el-tag type="warning" effect="plain">快照随版本留存，不随删除消失</el-tag>
+        </div>
+        <el-table :data="orphanGroups" size="small" border>
+          <el-table-column label="机组编号" prop="turbineCode" width="160">
+            <template #default="{ row }">
+              <span class="mono">{{ row.turbineCode }}</span>
+              <el-tag size="small" type="info" effect="plain" class="orphan-tag">台账已无此机组</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="报告编号" width="220">
+            <template #default="{ row }">
+              <span class="mono">{{ row.latest.reportNo }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="最新版本" width="120">
+            <template #default="{ row }">
+              <el-tag size="small" :type="reportStatusTagType(row.latest.status)">
+                V{{ row.latest.versionNo }} · {{ row.latest.status }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="历史版本数" prop="count" width="110" />
+          <el-table-column label="操作" min-width="180">
+            <template #default="{ row }">
+              <el-button size="small" :icon="View" @click="viewVersion(row.latest.id)">打开最新版</el-button>
+              <el-button size="small" :icon="Download" @click="exportReportJson(row.latest.snapshot)">
+                导出
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+
+      <template v-if="selectedTurbineId">
+        <div class="section-card">
+          <div class="section-card__head">
+            <h3>报告出具与修订</h3>
+            <div class="toolbar">
+              <el-tag v-if="latestVersion" type="success" effect="plain">
+                最新版 {{ latestVersion.reportNo }} V{{ latestVersion.versionNo }}
+              </el-tag>
+              <el-button
+                type="primary"
+                :icon="Promotion"
+                :disabled="turbineVersions.length > 0"
+                @click="openIssue"
+              >
+                出具（冻结当前台账）
+              </el-button>
+              <el-button
+                type="warning"
+                plain
+                :icon="EditPen"
+                :disabled="!latestVersion"
+                @click="openRevise"
+              >
+                从最新版发起修订
+              </el-button>
+            </div>
+          </div>
+          <el-alert
+            v-if="turbineVersions.length === 0"
+            type="info"
+            :closable="false"
+            show-icon
+            title="该机组尚未出具报告：下方预览按当前台账实时计算，改缺陷或工单数字会跟着变，不能作为月底对账依据。"
+            class="version-banner"
+          />
+          <el-table v-else :data="turbineVersions" size="small" border class="version-table">
+            <el-table-column label="版本" width="130">
+              <template #default="{ row }">
+                <el-tag size="small" :type="reportStatusTagType(row.status)">
+                  V{{ row.versionNo }} · {{ row.status }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="报告编号" width="210">
+              <template #default="{ row }"><span class="mono">{{ row.reportNo }}</span></template>
+            </el-table-column>
+            <el-table-column label="出具时间" width="180">
+              <template #default="{ row }">{{ formatTimestamp(row.issuedAt) }}</template>
+            </el-table-column>
+            <el-table-column label="出具人" prop="issuedBy" width="110" />
+            <el-table-column label="修订说明" min-width="220">
+              <template #default="{ row }">
+                <span v-if="row.revisionReason">{{ row.revisionReason }}</span>
+                <span v-else class="muted">首版出具</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="替代关系" width="220">
+              <template #default="{ row }">
+                <template v-if="row.supersededByVersionId">
+                  <el-tag
+                    size="small"
+                    type="info"
+                    class="link-tag"
+                    @click="viewVersion(row.supersededByVersionId!)"
+                  >
+                    已被 V{{ reportVersionStore.versionById(row.supersededByVersionId)?.versionNo }} 替代 →
+                  </el-tag>
+                </template>
+                <template v-else-if="row.supersedesVersionId">
+                  <el-tag
+                    size="small"
+                    type="warning"
+                    effect="plain"
+                    class="link-tag"
+                    @click="viewVersion(row.supersedesVersionId!)"
+                  >
+                    ← 更正自 V{{ reportVersionStore.versionById(row.supersedesVersionId)?.versionNo }}
+                  </el-tag>
+                </template>
+                <span v-else class="muted">首版</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="170">
+              <template #default="{ row }">
+                <el-button
+                  size="small"
+                  :icon="View"
+                  :type="activeVersion?.id === row.id ? 'primary' : 'default'"
+                  @click="viewVersion(row.id)"
+                >
+                  查看快照
+                </el-button>
+                <el-button size="small" :icon="Download" @click="exportReportJson(row.snapshot)">
+                  导出
+                </el-button>
+              </template>
+            </el-table-column>
+            <template #empty>
+              <span class="muted">尚无已出具版本</span>
+            </template>
+          </el-table>
+        </div>
+      </template>
+
       <template v-if="report">
+        <!-- 口径提示：防止把快照错当当前台账，或把实时预览错当已出具报告 -->
+        <el-alert
+          v-if="activeVersion"
+          :key="activeVersion.id"
+          :type="activeVersionIsOrphan ? 'warning' : 'success'"
+          :closable="false"
+          show-icon
+          class="version-banner"
+        >
+          <template #title>
+            正在查看冻结快照 {{ activeVersion.reportNo }} V{{ activeVersion.versionNo }}
+            （{{ activeVersion.status }}），出具于 {{ formatTimestamp(activeVersion.issuedAt) }}，
+            出具人 {{ activeVersion.issuedBy }}。
+            <span v-if="activeVersionIsOrphan">该机组已移出台账，以下为历史存档，仍可导出对账。</span>
+            <span v-else>之后修改缺陷或工单不影响本版数字。</span>
+            <el-button v-if="selectedTurbineId" link type="primary" @click="backToLive">
+              返回当前台账预览
+            </el-button>
+          </template>
+          <template #default>
+            <span v-if="activeVersion.revisionReason">修订说明：{{ activeVersion.revisionReason }}</span>
+          </template>
+        </el-alert>
+        <el-alert
+          v-else
+          type="warning"
+          :closable="false"
+          show-icon
+          class="version-banner"
+          :title="
+            latestVersion
+              ? `当前为台账实时预览，非正式版本；最新已出具为 ${latestVersion.reportNo} V${latestVersion.versionNo}，更正请点「从最新版发起修订」生成 V${latestVersion.versionNo + 1}。`
+              : '当前为台账实时预览：数字随缺陷 / 工单编辑即时变化；点「出具」冻结为 V1 后才作为对账依据。'
+          "
+        />
+
         <div class="stat-row">
           <StatBadge label="叶片" :value="report.summary.bladeCount" suffix="片" tone="info" icon="Grid" />
           <StatBadge label="展向分段" :value="report.summary.segmentCount" suffix="段" tone="default" icon="Histogram" />
@@ -319,15 +667,25 @@ watch(bladePanels, (panels) => {
         <div class="section-card">
           <div class="section-card__head">
             <h3>
-              巡检报告预览 · {{ report.turbine.code }}（{{ report.turbine.model }}）
+              巡检报告{{ activeVersion ? '（冻结快照）' : '预览（当前台账）' }} · {{ report.turbine.code }}（{{ report.turbine.model }}）
             </h3>
-            <span class="muted">风险分 {{ report.summary.riskScore }} · 生成时间 {{ report.generatedAt.replace('T', ' ').slice(0, 19) }}</span>
+            <span class="muted">
+              风险分 {{ report.summary.riskScore }} ·
+              {{ activeVersion ? '出具时间' : '生成时间' }}
+              {{ report.generatedAt.replace('T', ' ').slice(0, 19) }}
+            </span>
           </div>
           <el-descriptions :column="4" size="small" border class="report-meta">
             <el-descriptions-item label="轮毂高度">{{ report.turbine.hubHeightM }} m</el-descriptions-item>
             <el-descriptions-item label="投运日期">{{ report.turbine.commissionDate }}</el-descriptions-item>
             <el-descriptions-item label="登记叶片数">{{ report.turbine.bladeCount }} 片</el-descriptions-item>
             <el-descriptions-item label="结构版本">v{{ report.dbVersion }}</el-descriptions-item>
+            <el-descriptions-item v-if="report.version" label="报告编号 / 版本">
+              <span class="mono">{{ report.version.reportNo }} · V{{ report.version.versionNo }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item v-else label="版本状态">
+              <el-tag size="small" type="info" effect="plain">未出具（实时预览）</el-tag>
+            </el-descriptions-item>
           </el-descriptions>
 
           <div class="dist-grid">
@@ -363,13 +721,7 @@ watch(bladePanels, (panels) => {
             <h3>叶片与展向分段明细</h3>
             <span class="muted">共 {{ bladePanels.length }} 片叶片</span>
           </div>
-          <EmptyPanel
-            v-if="bladePanels.length === 0"
-            title="该机组尚未登记叶片"
-            description="到机组合账编辑机组补足叶片数，或在叶片分段页生成展向分段。"
-            compact
-          />
-          <el-collapse v-else v-model="activePanels">
+          <el-collapse v-model="activePanels">
             <el-collapse-item
               v-for="panel in bladePanels"
               :key="panel.blade.id"
@@ -493,14 +845,60 @@ watch(bladePanels, (panels) => {
           </el-table>
         </div>
       </template>
-
-      <EmptyPanel
-        v-else
-        title="请选择机组"
-        description="选择一台机组后即可生成巡检报告预览。"
-        compact
-      />
     </template>
+
+    <!-- 出具对话框 -->
+    <el-dialog v-model="issueVisible" title="出具巡检报告（冻结当前台账）" width="520px" destroy-on-close>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="出具瞬间会把机组 → 叶片 → 分段 → 缺陷 → 工单整条链复制为 V1 快照；之后再改缺陷或工单，本版数字不变。"
+        class="import-alert"
+      />
+      <el-form label-width="80px">
+        <el-form-item label="出具人" required>
+          <el-input v-model="issueForm.issuedBy" placeholder="如：值班员张三" maxlength="20" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="issueVisible = false">取消</el-button>
+        <el-button type="primary" :loading="issueSubmitting" @click="submitIssue">确认出具 V1</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 修订对话框 -->
+    <el-dialog v-model="reviseVisible" title="从最新版发起修订" width="560px" destroy-on-close>
+      <el-alert
+        v-if="latestVersion"
+        type="warning"
+        :closable="false"
+        show-icon
+        :title="`将按当前台账重新冻结，生成 ${latestVersion.reportNo} V${latestVersion.versionNo + 1}；V${latestVersion.versionNo} 原样保留并标记为「已替代」。`"
+        class="import-alert"
+      />
+      <el-form label-width="80px">
+        <el-form-item label="出具人" required>
+          <el-input v-model="reviseForm.issuedBy" placeholder="如：值班员张三" maxlength="20" />
+        </el-form-item>
+        <el-form-item label="修订说明" required>
+          <el-input
+            v-model="reviseForm.revisionReason"
+            type="textarea"
+            :rows="3"
+            placeholder="说明更正原因，如：缺陷等级现场复核由中度改重度、工单班组调整"
+            maxlength="200"
+            show-word-limit
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="reviseVisible = false">取消</el-button>
+        <el-button type="warning" :loading="reviseSubmitting" @click="submitRevise">
+          确认修订为 V{{ (latestVersion?.versionNo ?? 1) + 1 }}
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="structureVisible" title="导出结构预览（纯文本）" width="860px">
       <pre class="structure-preview">{{ structureText }}</pre>
@@ -524,10 +922,11 @@ watch(bladePanels, (panels) => {
           <el-descriptions-item label="分段">{{ importCounts.segments }}</el-descriptions-item>
           <el-descriptions-item label="缺陷">{{ importCounts.defects }}</el-descriptions-item>
           <el-descriptions-item label="工单">{{ importCounts.workOrders }}</el-descriptions-item>
+          <el-descriptions-item label="报告版本">{{ importCounts.reportVersions ?? 0 }}</el-descriptions-item>
           <el-descriptions-item label="文件版本">v{{ importPayload.dbVersion }}</el-descriptions-item>
         </el-descriptions>
         <el-radio-group v-model="importMode" class="import-mode">
-          <el-radio value="overwrite">覆盖导入（先清空本地全部数据）</el-radio>
+          <el-radio value="overwrite">覆盖导入（先清空本地全部数据，含已出具报告版本）</el-radio>
           <el-radio value="merge">按 id 合并（同 id 覆盖）</el-radio>
           <el-radio value="append">追加导入（重新分配 id，不覆盖现有记录）</el-radio>
         </el-radio-group>
@@ -562,6 +961,22 @@ watch(bladePanels, (panels) => {
 <style scoped>
 .turbine-select {
   width: 240px;
+}
+
+.version-banner {
+  margin-bottom: 14px;
+}
+
+.version-table {
+  margin-top: 12px;
+}
+
+.link-tag {
+  cursor: pointer;
+}
+
+.orphan-tag {
+  margin-left: 8px;
 }
 
 .report-meta {
